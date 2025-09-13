@@ -1,0 +1,317 @@
+/*
+Package exitplan implements a simple mechanism for managing a lifetime of an application.
+It provides a way to register functions that will be called when the application is about to exit.
+It distinguishes between starting, running and teardown phases.
+
+The application is considered to be starting before calling Exitplan.Run().
+You can use Exitplan.StartingContext() to get a context that can be used to control the startup phase.
+Starting context is canceled when the startup phase is over.
+
+The application is considered to be running after calling Exitplan.Run() and before calling Exitplan.Exit().
+You can use Exitplan.Context() to get a context that can be used to control the running phase.
+It is canceled when the application is about to exit.
+
+The application is considered to be tearing down after calling Exitplan.Exit().
+You can use Exitplan.TeardownContext() to get a context that can be used to control the teardown phase.
+It is canceled when the teardown timeout is reached.
+
+Ordering of shutdown callbacks
+Exitplan executes registered exit callbacks in LIFO order (last registered, first executed).
+Async only offloads the execution to a goroutine, but Exitplan still waits for all callbacks up to the
+teardown timeout.
+*/
+package exitplan
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+var (
+	// ErrSignaled indicates that the application received a termination signal
+	ErrSignaled = errors.New("exitplan: received signal")
+
+	// ErrGracefulShutdown indicates that the application was requested to shut down gracefully
+	ErrGracefulShutdown = errors.New("exitplan: graceful shutdown requested")
+
+	// ErrStartupTimeout indicates that the application failed to start within the configured timeout
+	ErrStartupTimeout = errors.New("exitplan: startup phase timeout exceeded")
+)
+
+type Exitplan struct {
+	phase atomic.Int32
+	die   chan struct{}
+
+	runningCtx    context.Context
+	runningCancel context.CancelCauseFunc
+
+	startingCtx     context.Context
+	startingCancel  context.CancelFunc
+	startingTimeout time.Duration
+
+	teardownCtx     context.Context
+	teardownCancel  context.CancelFunc
+	teardownTimeout time.Duration
+
+	callbacks []*callback
+
+	errorHandler func(error)
+	callbacksMu  *sync.Mutex
+}
+
+// New creates a new instance of Exitplan. It will start in the starting phase.
+// Use the With* options to configure it.
+func New(opts ...opt) *Exitplan {
+	runningCtx, runningCancel := context.WithCancelCause(context.Background())
+	teardownCtx, teardownCancel := context.WithCancel(context.Background())
+	l := &Exitplan{
+		die:         make(chan struct{}),
+		callbacksMu: &sync.Mutex{},
+		callbacks:   make([]*callback, 0),
+
+		runningCtx:    runningCtx,
+		runningCancel: runningCancel,
+
+		teardownCtx:    teardownCtx,
+		teardownCancel: teardownCancel,
+	}
+	for _, opt := range opts {
+		opt(l)
+	}
+
+	l.start()
+
+	return l
+}
+
+func (l *Exitplan) start() {
+	l.phase.Store(int32(phaseStarting))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	if l.startingTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, l.startingTimeout)
+		go func() {
+			<-ctx.Done()
+
+			if l.phase.Load() == int32(phaseStarting) {
+				l.runningCancel(ErrStartupTimeout)
+				close(l.die)
+			}
+		}()
+	}
+
+	l.startingCtx = ctx
+	l.startingCancel = cancel
+}
+
+// StartingContext returns a context for a starting phase. It can be used to control the startup of the application.
+// StartingContext will be canceled after the starting timeout or when Exitplan.Run() is called.
+func (l *Exitplan) StartingContext() context.Context {
+	return l.startingCtx
+}
+
+// Context returns a main context. IT will be canceled when the application is about to exit.
+// It can be used to control the lifetime of the application.
+// It will be canceled after calling Exitplan.Exit().
+func (l *Exitplan) Context() context.Context {
+	return l.runningCtx
+}
+
+// TeardownContext returns a teardown context. It will be canceled after the teardown timeout.
+// It can be used to control the shutdown of the application.
+// This context is the same as the one passed to the callbacks registered with OnExit* methods.
+func (l *Exitplan) TeardownContext() context.Context {
+	return l.teardownCtx
+}
+
+// OnExit registers a callback that will be called when the application is about to exit.
+// Has no effect after calling Exitplan.Run().
+// Use exitplan.Async option to execute the callback in a separate goroutine.
+// exitplan.PanicOnError has no effect on this function.
+// See also: OnExitWithError, OnExitWithContext, OnExitWithContextError.
+func (l *Exitplan) OnExit(callback func(), exitOpts ...exitCallbackOpt) {
+	l.addCallback(func(ctx context.Context) error {
+		return callbackWithContext(ctx, func() error {
+			callback()
+			return nil
+		})
+	}, exitOpts...)
+}
+
+// OnExitWithError registers a callback that will be called when the application is about to exit.
+// Has no effect after calling Exitplan.Run().
+// The callback can return an error that will be passed to the error handler.
+// Use exitplan.Async option to execute the callback in a separate goroutine.
+// Use exitplan.PanicOnError to panic with the error returned by the callback.
+func (l *Exitplan) OnExitWithError(callback func() error, exitOpts ...exitCallbackOpt) {
+	l.addCallback(func(ctx context.Context) error {
+		return callbackWithContext(ctx, callback)
+	}, exitOpts...)
+}
+
+// OnExitWithContext registers a callback that will be called when the application is about to exit.
+// Has no effect after calling Exitplan.Run().
+// The callback will receive a context that will be canceled after the teardown timeout.
+// Use exitplan.Async option to execute the callback in a separate goroutine.
+// exitplan.PanicOnError has no effect on this function.
+func (l *Exitplan) OnExitWithContext(callback func(context.Context), exitOpts ...exitCallbackOpt) {
+	l.addCallback(func(ctx context.Context) error {
+		callback(ctx)
+		return nil
+	}, exitOpts...)
+}
+
+// OnExitWithContextError registers a callback that will be called when the application is about to exit.
+// Has no effect after calling Exitplan.Run().
+// The callback will receive a context that will be canceled after the teardown timeout.
+// The callback can return an error that will be passed to the error handler.
+// Use exitplan.Async option to execute the callback in a separate goroutine.
+// Use exitplan.PanicOnError to panic with the error returned by the callback.
+func (l *Exitplan) OnExitWithContextError(callback func(context.Context) error, exitOpts ...exitCallbackOpt) {
+	l.addCallback(callback, exitOpts...)
+}
+
+func (l *Exitplan) addCallback(cb func(context.Context) error, exitOpts ...exitCallbackOpt) {
+	if l.phase.Load() != int32(phaseStarting) {
+		return
+	}
+
+	c := &callback{
+		fn: cb,
+	}
+
+	for _, opt := range exitOpts {
+		opt(c)
+	}
+
+	l.callbacksMu.Lock()
+	defer l.callbacksMu.Unlock()
+	l.callbacks = append(l.callbacks, c)
+}
+
+// Exit stops the application. It will cause the application to exit with the specified reason.
+// If the reason is nil, ErrGracefulShutdown will be used.
+// Multiple calls to Exit are safe, but only the first one will have an effect.
+func (l *Exitplan) Exit(reason error) {
+	if reason == nil {
+		reason = ErrGracefulShutdown
+	}
+
+	if !l.phase.CompareAndSwap(int32(phaseRunning), int32(phaseTeardown)) {
+		return
+	}
+
+	l.runningCancel(reason)
+	close(l.die)
+}
+
+// Run starts the application. It will block until the application is stopped by calling Exit.
+// It will also block until all the registered callbacks are executed.
+// If the teardown timeout is set, it will be used to cancel the context passed to the callbacks.
+// Returns the error that caused the application to stop.
+func (l *Exitplan) Run() (exitCause error) {
+	if !l.phase.CompareAndSwap(int32(phaseStarting), int32(phaseRunning)) {
+		panic("Exitplan.Run() called after Exitplan.Exit()")
+	}
+
+	l.startingCancel()
+
+	<-l.die
+
+	go func() {
+		if l.teardownTimeout > 0 {
+			<-time.After(l.teardownTimeout)
+			l.teardownCancel()
+		}
+	}()
+
+	l.exit()
+
+	return context.Cause(l.runningCtx)
+}
+
+func (l *Exitplan) exit() {
+	ctx := l.TeardownContext()
+
+	wg := sync.WaitGroup{}
+
+	for _, cb := range l.callbacks {
+		if cb.executeBehaviour != executeAsync {
+			continue
+		}
+
+		wg.Add(1)
+		go func(cb *callback) {
+			defer wg.Done()
+
+			execCtx := ctx
+			if cb.timeout > 0 {
+				var cancel context.CancelFunc
+				execCtx, cancel = context.WithTimeout(ctx, cb.timeout)
+				defer cancel()
+			}
+
+			if err := cb.fn(execCtx); err != nil {
+				l.handleExitError(cb.errorBehaviour, err)
+			}
+		}(cb)
+	}
+
+	for i := len(l.callbacks) - 1; i >= 0; i-- {
+		cb := l.callbacks[i]
+		if cb.executeBehaviour != executeSync {
+			continue
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		var cancel context.CancelFunc = func() {}
+		execCtx := ctx
+		if cb.timeout > 0 {
+			execCtx, cancel = context.WithTimeout(ctx, cb.timeout)
+		}
+
+		if err := cb.fn(execCtx); err != nil {
+			l.handleExitError(cb.errorBehaviour, err)
+		}
+
+		cancel()
+	}
+
+	wg.Wait()
+}
+
+func (l *Exitplan) handleExitError(errBehaviour exitBehaviour, err error) {
+	if l.errorHandler != nil {
+		l.errorHandler(err)
+	}
+
+	if errBehaviour == panicOnError {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return // ignore context errors
+		}
+		if err != nil {
+			panic(err)
+		}
+	}
+}
+
+func callbackWithContext(ctx context.Context, callback func() error) error {
+	errChan := make(chan error)
+	go func() {
+		errChan <- callback()
+	}()
+	select {
+	case err := <-errChan:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
