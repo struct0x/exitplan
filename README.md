@@ -1,4 +1,5 @@
 # Exitplan
+![Coverage](https://img.shields.io/badge/Coverage-83.2%25-brightgreen)
 
 A Go library for managing the lifecycle of an application with graceful shutdown capabilities.
 
