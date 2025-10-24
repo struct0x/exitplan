@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -165,10 +166,10 @@ func TestOnExitTimeout(t *testing.T) {
 
 	l := exitplan.New()
 
-	called := false
+	called := atomic.Bool{}
 	l.OnExit(func() {
 		time.Sleep(2 * timeout)
-		called = true
+		called.Store(true)
 	}, exitplan.Timeout(timeout))
 
 	go func() {
@@ -186,7 +187,7 @@ func TestOnExitTimeout(t *testing.T) {
 		t.Errorf("expected timeout between %v and %v, got %v", timeout-timeoutJitter, timeout+timeoutJitter, end.Sub(start))
 	}
 
-	if called {
+	if called.Load() {
 		t.Error("callback was called")
 	}
 }
