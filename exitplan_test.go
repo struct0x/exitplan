@@ -196,13 +196,16 @@ func TestOnExitTimeout(t *testing.T) {
 func TestCallbackName(t *testing.T) {
 	t.Parallel()
 
+	mu := sync.Mutex{}
 	names := make([]string, 0)
 
 	l := exitplan.New(
 		exitplan.WithExitError(func(err error) {
 			var exErr *exitplan.CallbackErr
 			if errors.As(err, &exErr) {
+				mu.Lock()
 				names = append(names, exErr.Name)
+				mu.Unlock()
 			}
 		}),
 	)
