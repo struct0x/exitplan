@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -58,7 +59,7 @@ func TestExitCallbacks(t *testing.T) {
 	}, exitplan.Async)
 
 	go func() {
-		<-l.StartingContext().Done()
+		<-l.Started()
 		l.Exit(errUnexpected)
 	}()
 
@@ -115,7 +116,7 @@ func TestPanic(t *testing.T) {
 	}, exitplan.PanicOnError)
 
 	go func() {
-		<-l.StartingContext().Done()
+		<-l.Started()
 		l.Exit(errUnexpected)
 	}()
 
@@ -143,7 +144,7 @@ func TestTeardownTimeout(t *testing.T) {
 	})
 
 	go func() {
-		<-l.StartingContext().Done()
+		<-l.Started()
 		l.Exit(errUnexpected)
 	}()
 
@@ -173,7 +174,7 @@ func TestOnExitTimeout(t *testing.T) {
 	}, exitplan.Timeout(timeout))
 
 	go func() {
-		<-l.StartingContext().Done()
+		<-l.Started()
 		l.Exit(errUnexpected)
 	}()
 
@@ -189,5 +190,48 @@ func TestOnExitTimeout(t *testing.T) {
 
 	if called.Load() {
 		t.Error("callback was called")
+	}
+}
+
+func TestCallbackName(t *testing.T) {
+	t.Parallel()
+
+	mu := sync.Mutex{}
+	names := make([]string, 0)
+
+	l := exitplan.New(
+		exitplan.WithExitError(func(err error) {
+			var exErr *exitplan.CallbackErr
+			if errors.As(err, &exErr) {
+				mu.Lock()
+				names = append(names, exErr.Name)
+				mu.Unlock()
+			}
+		}),
+	)
+
+	l.OnExitWithContextError(func(ctx context.Context) error {
+		return errors.New("test error")
+	}, exitplan.Name("cb1"), exitplan.Async)
+
+	l.OnExitWithContextError(func(ctx context.Context) error {
+		return errors.New("test error")
+	}, exitplan.Name("cb2"))
+
+	go func() {
+		<-l.Started()
+		l.Exit(errUnexpected)
+	}()
+
+	if err := l.Run(); !errors.Is(err, errUnexpected) {
+		t.Errorf("expected %q, got: %q", errUnexpected, err)
+	}
+
+	if len(names) != 2 {
+		t.Errorf("expected 2 callback calls got %d", len(names))
+	}
+
+	if !reflect.DeepEqual(names, []string{"cb2", "cb1"}) {
+		t.Errorf("expected names to have cb1 callback, got: %v", names)
 	}
 }
