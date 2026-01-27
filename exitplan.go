@@ -1,15 +1,10 @@
 /*
 Package exitplan implements a simple mechanism for managing a lifetime of an application.
 It provides a way to register functions that will be called when the application is about to exit.
-It distinguishes between starting, running and teardown phases.
-
-The application is considered to be starting before calling Exitplan.Run().
-You can use Exitplan.StartingContext() to get a context that can be used to control the startup phase.
-Starting context is canceled when the startup phase is over.
 
 The application is considered to be running after calling Exitplan.Run() and before calling Exitplan.Exit().
-You can use Exitplan.Context() to get a context that can be used to control the running phase.
-It is canceled when the application is about to exit.
+Use Exitplan.Started() to receive a signal when the application enters the running phase.
+Use Exitplan.Context() to get a context bound to the application lifetime.
 
 The application is considered to be tearing down after calling Exitplan.Exit().
 You can use Exitplan.TeardownContext() to get a context that can be used to control the teardown phase.
@@ -107,15 +102,13 @@ func (l *Exitplan) start() {
 	l.startingCancel = cancel
 }
 
-// StartingContext returns a context for a starting phase. It can be used to control the startup of the application.
-// StartingContext will be canceled after the starting timeout or when Exitplan.Run() is called.
-func (l *Exitplan) StartingContext() context.Context {
-	return l.startingCtx
+// Started returns a channel that is closed after Run is called.
+func (l *Exitplan) Started() <-chan struct{} {
+	return l.startingCtx.Done()
 }
 
-// Context returns a main context. IT will be canceled when the application is about to exit.
-// It can be used to control the lifetime of the application.
-// It will be canceled after calling Exitplan.Exit().
+// Context returns a main context. It will be canceled when the application is about to exit.
+// It can be used to control the lifetime of the application (via Exit(), signal, or startup timeout).
 func (l *Exitplan) Context() context.Context {
 	return l.runningCtx
 }
@@ -180,7 +173,8 @@ func (l *Exitplan) addCallback(cb func(context.Context) error, exitOpts ...exitC
 	}
 
 	c := &callback{
-		fn: cb,
+		name: callerLocation(3),
+		fn:   cb,
 	}
 
 	for _, opt := range exitOpts {
@@ -255,7 +249,10 @@ func (l *Exitplan) exit() {
 			}
 
 			if err := cb.fn(execCtx); err != nil {
-				l.handleExitError(cb.errorBehaviour, err)
+				l.handleExitError(cb.errorBehaviour, &CallbackErr{
+					Name: cb.name,
+					Err:  err,
+				})
 			}
 		}(cb)
 	}
@@ -279,7 +276,10 @@ func (l *Exitplan) exit() {
 		}
 
 		if err := cb.fn(execCtx); err != nil {
-			l.handleExitError(cb.errorBehaviour, err)
+			l.handleExitError(cb.errorBehaviour, &CallbackErr{
+				Name: cb.name,
+				Err:  err,
+			})
 		}
 
 		cancel()

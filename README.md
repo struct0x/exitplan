@@ -1,4 +1,5 @@
 # Exitplan
+
 [![Go Reference](https://pkg.go.dev/badge/github.com/struct0x/exitplan.svg)](https://pkg.go.dev/github.com/struct0x/exitplan)
 ![Coverage](https://img.shields.io/badge/Coverage-83.2%25-brightgreen)
 
@@ -6,12 +7,12 @@ A Go library for managing the lifecycle of an application with graceful shutdown
 
 ## Overview
 
-The Exitplan library provides a simple mechanism for managing the lifetime of an application. 
-It helps you handle application startup, running, and shutdown phases with proper resource cleanup. 
+The Exitplan library provides a simple mechanism for managing the lifetime of an application.
+It helps you handle application running, and shutdown phases with proper resource cleanup.
 
 Key features include:
 
-- Distinct application lifecycle phases (starting, running, teardown)
+- Distinct application lifecycle phases (running, teardown)
 - Context-based lifecycle management
 - Graceful shutdown with customizable timeout
 - Flexible callback registration for cleanup operations
@@ -27,20 +28,49 @@ go get github.com/struct0x/exitplan
 
 ## Lifecycle Phases
 
-Exitplan splits application lifetime into three phases, each with its own context:
+Exitplan manages two lifecycle phases:
 
-- **Starting**: before `Run()` begins. Use `StartingContext()` for initialization.  
-  It is canceled immediately when `Run()` starts.
-
-- **Running**: active between `Run()` and `Exit()`. Use `Context()` for workers and other long-running tasks.  
-  It is canceled as soon as shutdown begins.
+- **Running**: active between `Run()` and `Exit()`. Use
+  `Context()` for workers and other long-running tasks.  
+  It is canceled as soon as shutdown begins (via `Exit()`, signal, or startup timeout).
 
 - **Teardown**: after `Exit()` is called. Use `TeardownContext()` in shutdown callbacks.  
   It is canceled when the global teardown timeout elapses.
 
+Use
+`Started()` to receive a signal when the application enters the running phase.                                                                                                                                                                                                                                                                                                                                             
+This is useful for readiness probes or coordinating dependent services.
+
+### Startup Timeout
+
+Use `WithStartupTimeout()` to detect stuck initialization:
+
+  ```go      
+package main
+
+import (
+	"time"
+
+	"github.com/struct0x/exitplan"
+)
+
+func main() {
+	_ = exitplan.New(
+		exitplan.WithStartupTimeout(10 * time.Second),
+	)
+
+	// If Run() isn't called within 10 seconds,
+	// Context() is canceled and teardown begins
+}
+
+  ```
+
+This is useful when initialization depends on external services that might hang.
+
 ### Callback ordering
 
-Shutdown callbacks registered with `OnExit*` are executed in **LIFO order** (last registered, first executed).  
+Shutdown callbacks registered with `OnExit*` are executed in **LIFO order
+** (last registered, first executed).  
 This mirrors resource lifecycles: if you start DB then HTTP, shutdown runs HTTP then DB.  
 Callbacks marked with `Async` are awaited up to the teardown timeout.
 
@@ -107,13 +137,18 @@ func main() {
 		}),
 	)
 
-	// Use the starting context for initialization
-	startingCtx := ex.StartingContext()
-	_ = startingCtx
-	// Initialize resources with the starting context
+	// Signal readiness when Run() starts
+	go func() {
+		<-ex.Started()
+		fmt.Println("Application is now running and ready")
+		// e.g., signal readiness probe, notify dependent services
+	}()
 
-	// For example, pinging a database connection to ensure it is ready, yet it should not freeze the application
-	// err := db.Ping(startingCtx)
+	// Initialize resources before Run()
+	// Use context.WithTimeout() if you need bounded initialization
+	// ctx, cancel := context.WithTimeout(ex.Context(), 5*time.Second)	
+	// defer cancel()
+	// err := db.Ping(ctx)
 
 	// Register cleanup with context awareness
 	ex.OnExitWithContext(func(ctx context.Context) {
@@ -145,16 +180,16 @@ func main() {
 	fmt.Println("Application starting...")
 
 	// Get the running context to use in your application
-	runningCtx := ex.Context()
+	ctx := ex.Context()
 
 	// Start a worker that respects the application lifecycle
 	workerDone := make(chan struct{})
 	go func() {
 		for {
 			select {
-			case <-runningCtx.Done():
+			case <-ctx.Done():
 				fmt.Println("Worker shutting down...")
-				time.Sleep(100 * time.Millisecond) // Simulate some work
+				time.Sleep(100 * time.Millisecond) // Simulate some teardown work
 				close(workerDone)
 				return
 			case <-time.After(1 * time.Second):
