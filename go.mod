@@ -1,3 +1,3 @@
 module github.com/struct0x/exitplan
 
-go 1.25
+go 1.24
