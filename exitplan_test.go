@@ -60,7 +60,12 @@ func TestExitCallbacks(t *testing.T) {
 
 	go func() {
 		<-l.Started()
-		l.Exit(errUnexpected)
+
+		l.OnExit(func() {
+			t.Error("this should never be called")
+		})
+
+		_ = l.Exit(errUnexpected)
 	}()
 
 	if err := l.Run(); !errors.Is(err, errUnexpected) {
@@ -103,28 +108,75 @@ func TestStartupTimeout(t *testing.T) {
 func TestPanic(t *testing.T) {
 	t.Parallel()
 
-	l := exitplan.New()
+	t.Run("panic_in_run", func(t *testing.T) {
+		l := exitplan.New()
 
-	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("The code did not panic")
+		defer func() {
+			if r := recover(); r == nil {
+				t.Errorf("The code did not panic")
+			}
+		}()
+
+		l.OnExitWithContextError(func(ctx context.Context) error {
+			return errors.New("test error")
+		}, exitplan.PanicOnError)
+
+		go func() {
+			<-l.Started()
+			_ = l.Exit(errUnexpected)
+		}()
+
+		if err := l.Run(); !errors.Is(err, errUnexpected) {
+			t.Errorf("expected %q, got: %q", errUnexpected, err)
 		}
-	}()
 
-	l.OnExitWithContextError(func(ctx context.Context) error {
-		return errors.New("test error")
-	}, exitplan.PanicOnError)
+		t.Error("The code did not panic")
+	})
 
-	go func() {
-		<-l.Started()
-		l.Exit(errUnexpected)
-	}()
+	t.Run("panic_in_exit", func(t *testing.T) {
+		l := exitplan.New()
 
-	if err := l.Run(); !errors.Is(err, errUnexpected) {
-		t.Errorf("expected %q, got: %q", errUnexpected, err)
-	}
+		defer func() {
+			if r := recover(); r == nil {
+				t.Errorf("The code did not panic")
+			}
+		}()
 
-	t.Error("The code did not panic")
+		l.OnExitWithContextError(func(ctx context.Context) error {
+			return errors.New("test error")
+		}, exitplan.PanicOnError)
+
+		if err := l.Exit(errUnexpected); !errors.Is(err, errUnexpected) {
+			t.Errorf("expected %q, got: %q", errUnexpected, err)
+		}
+
+		t.Error("The code did not panic")
+	})
+
+	t.Run("async_panic", func(t *testing.T) {
+		l := exitplan.New()
+
+		defer func() {
+			if r := recover(); r == nil {
+				t.Errorf("The code did not panic")
+			}
+		}()
+
+		l.OnExitWithContextError(func(ctx context.Context) error {
+			return errors.New("test error")
+		}, exitplan.Async, exitplan.PanicOnError)
+
+		go func() {
+			<-l.Started()
+			_ = l.Exit(errUnexpected)
+		}()
+
+		if err := l.Run(); !errors.Is(err, errUnexpected) {
+			t.Errorf("expected %q, got: %q", errUnexpected, err)
+		}
+
+		t.Error("The code did not panic")
+	})
 }
 
 func TestTeardownTimeout(t *testing.T) {
@@ -145,7 +197,7 @@ func TestTeardownTimeout(t *testing.T) {
 
 	go func() {
 		<-l.Started()
-		l.Exit(errUnexpected)
+		_ = l.Exit(errUnexpected)
 	}()
 
 	start := time.Now()
@@ -175,7 +227,7 @@ func TestOnExitTimeout(t *testing.T) {
 
 	go func() {
 		<-l.Started()
-		l.Exit(errUnexpected)
+		_ = l.Exit(errUnexpected)
 	}()
 
 	start := time.Now()
@@ -220,7 +272,7 @@ func TestCallbackName(t *testing.T) {
 
 	go func() {
 		<-l.Started()
-		l.Exit(errUnexpected)
+		_ = l.Exit(errUnexpected)
 	}()
 
 	if err := l.Run(); !errors.Is(err, errUnexpected) {
@@ -233,5 +285,194 @@ func TestCallbackName(t *testing.T) {
 
 	if !reflect.DeepEqual(names, []string{"cb2", "cb1"}) {
 		t.Errorf("expected names to have cb1 callback, got: %v", names)
+	}
+}
+
+func TestShortCircuitExit(t *testing.T) {
+	t.Parallel()
+
+	callsMutex := &sync.Mutex{}
+	calls := make([]string, 0, 5)
+	asyncCalled := false
+
+	run := func() error {
+		l := exitplan.New()
+
+		l.OnExit(func() {
+			callsMutex.Lock()
+			defer callsMutex.Unlock()
+			calls = append(calls, "exit")
+		})
+
+		l.OnExitWithError(func() error {
+			callsMutex.Lock()
+			defer callsMutex.Unlock()
+			calls = append(calls, "exit with error")
+			return nil
+		})
+
+		l.OnExitWithContext(func(ctx context.Context) {
+			callsMutex.Lock()
+			defer callsMutex.Unlock()
+			calls = append(calls, "exit with context")
+		})
+
+		l.OnExitWithContextError(func(ctx context.Context) error {
+			callsMutex.Lock()
+			defer callsMutex.Unlock()
+			calls = append(calls, "exit with context and error")
+			return nil
+		})
+
+		l.OnExitWithContextError(func(ctx context.Context) error {
+			callsMutex.Lock()
+			defer callsMutex.Unlock()
+			asyncCalled = true
+			return nil
+		}, exitplan.Async)
+
+		return l.Exit(errUnexpected)
+	}
+
+	err := run()
+	if !errors.Is(err, errUnexpected) {
+		t.Fatalf("expected %q, got: %q", errUnexpected, err)
+	}
+
+	expected := []string{"exit with context and error", "exit with context", "exit with error", "exit"}
+	if slices.Compare(calls, expected) != 0 {
+		t.Errorf("expected 5 calls, got %v", calls)
+	}
+
+	if !asyncCalled {
+		t.Error("async callback was not called")
+	}
+}
+
+func TestStoppingSignal(t *testing.T) {
+	t.Parallel()
+
+	t.Run("fires_after_exit", func(t *testing.T) {
+		t.Parallel()
+
+		l := exitplan.New()
+		signals := make([]string, 0, 3)
+		done := make(chan struct{})
+
+		go func() {
+			defer close(done)
+
+			<-l.Started()
+			signals = append(signals, "started")
+
+			<-l.Stopping()
+			signals = append(signals, "stopping")
+
+			<-l.Completed()
+			signals = append(signals, "completed")
+		}()
+
+		go func() {
+			<-l.Started()
+			_ = l.Exit(errUnexpected)
+		}()
+
+		if err := l.Run(); !errors.Is(err, errUnexpected) {
+			t.Errorf("expected %q, got: %q", errUnexpected, err)
+		}
+
+		<-done
+
+		expected := []string{"started", "stopping", "completed"}
+		if !slices.Equal(signals, expected) {
+			t.Errorf("expected signals %v, got %v", expected, signals)
+		}
+	})
+
+	t.Run("fires_on_startup_timeout", func(t *testing.T) {
+		t.Parallel()
+
+		l := exitplan.New(exitplan.WithStartupTimeout(10 * time.Millisecond))
+
+		time.Sleep(20 * time.Millisecond)
+
+		select {
+		case <-l.Started():
+			t.Error("Started() should not fire on startup timeout")
+		default:
+		}
+
+		select {
+		case <-l.Stopping():
+		default:
+			t.Error("Stopping() should fire on startup timeout")
+		}
+	})
+
+	t.Run("fires_on_early_exit", func(t *testing.T) {
+		t.Parallel()
+
+		l := exitplan.New()
+
+		select {
+		case <-l.Started():
+			t.Error("Started() should not fire before Run()")
+		default:
+		}
+
+		_ = l.Exit(errUnexpected)
+
+		select {
+		case <-l.Started():
+			t.Error("Started() should not fire after early Exit()")
+		default:
+		}
+
+		select {
+		case <-l.Stopping():
+		default:
+			t.Error("Stopping() should fire after early Exit()")
+		}
+
+		select {
+		case <-l.Completed():
+		default:
+			t.Error("Completed() should fire after early Exit()")
+		}
+	})
+}
+
+func TestRegistersAfterExit(t *testing.T) {
+	t.Parallel()
+
+	callsMutex := &sync.Mutex{}
+	calls := make([]string, 0, 5)
+
+	l := exitplan.New()
+
+	l.OnExit(func() {
+		callsMutex.Lock()
+		defer callsMutex.Unlock()
+		calls = append(calls, "exit")
+	})
+
+	exitErr := l.Exit(nil)
+
+	l.OnExitWithContextError(func(ctx context.Context) error {
+		callsMutex.Lock()
+		defer callsMutex.Unlock()
+		calls = append(calls, "exit with context and error")
+		return nil
+	})
+
+	runErr := l.Run()
+
+	expected := []string{"exit"}
+	if slices.Compare(calls, expected) != 0 {
+		t.Errorf("expected 5 calls, got %v", calls)
+	}
+
+	if !errors.Is(exitErr, runErr) {
+		t.Errorf("expected %q, got: %q", exitErr, runErr)
 	}
 }

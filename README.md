@@ -35,12 +35,22 @@ Exitplan manages two lifecycle phases:
   `Context()` for workers and other long-running tasks.  
   It is canceled as soon as shutdown begins (via `Exit()`, signal, or startup timeout).
 
-- **Teardown**: after `Exit()` is called. Use `TeardownContext()` in shutdown callbacks.  
+- **Teardown**: calling `Exit(reason or nil)` starts the teardown.  
+  It blocks until all registered callbacks are complete.
+  Use `TeardownContext()` in shutdown callbacks.  
   It is canceled when the global teardown timeout elapses.
+
+> [!NOTE]
+> Calling `Exit()` before `Run()` starts the teardown immediately.
+> If no teardown timeout is set and a callback hangs, Exit() will block indefinitely.
 
 Use
 `Started()` to receive a signal when the application enters the running phase.                                                                                                                                                                                                                                                                                                                                             
 This is useful for readiness probes or coordinating dependent services.
+
+Use `Stopping()` to receive a signal when the application enters the teardown phase.
+
+Use `Completed()` to receive a signal when the teardown phase completes.
 
 ### Startup Timeout
 
@@ -140,8 +150,12 @@ func main() {
 
 	// Signal readiness when Run() starts
 	go func() {
-		<-ex.Started()
-		fmt.Println("Application is now running and ready")
+		select {
+		case <-ex.Started():
+			fmt.Println("Application is now running")
+		case <-ex.Stopping():
+			fmt.Println("Application is shutting down before it was ready")
+		}
 		// e.g., signal readiness probe, notify dependent services
 	}()
 
@@ -212,6 +226,49 @@ func main() {
 	fmt.Printf("Application exited: %v\n", exitCause)
 }
 
+```
+
+### Early Exit During Setup
+
+If initialization fails, use `Exit()` to short-circuit and unwind callbacks without calling `Run()`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"syscall"
+	"time"
+
+	"github.com/struct0x/exitplan"
+)
+
+func run() error {
+	ex := exitplan.New(
+		exitplan.WithSignal(syscall.SIGINT, syscall.SIGTERM),
+		exitplan.WithTeardownTimeout(5*time.Second),
+	)
+
+	db, err := connectDB()
+	if err != nil {
+		return ex.Exit(err) // teardown runs, then returns err
+	}
+	ex.OnExit(func() { db.Close() })
+
+	cache, err := connectCache()
+	if err != nil {
+		return ex.Exit(err) // db.Close() runs, then returns err
+	}
+	ex.OnExit(func() { cache.Close() })
+
+	return ex.Run()
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Println(err)
+	}
+}
 ```
 
 ## License

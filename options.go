@@ -39,7 +39,7 @@ func WithSignal(s1 os.Signal, sMany ...os.Signal) opt {
 
 		go func() {
 			sig := <-notify
-			l.Exit(fmt.Errorf("%w: %q", ErrSignaled, sig))
+			_ = l.Exit(fmt.Errorf("%w: %q", ErrSignaled, sig))
 		}()
 	}
 }
