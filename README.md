@@ -2,7 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/struct0x/exitplan.svg)](https://pkg.go.dev/github.com/struct0x/exitplan)
 [![Go Report Card](https://goreportcard.com/badge/github.com/struct0x/exitplan)](https://goreportcard.com/report/github.com/struct0x/exitplan)
-![Coverage](https://img.shields.io/badge/Coverage-90.9%25-brightgreen)
+![Coverage](https://img.shields.io/badge/Coverage-95.0%25-brightgreen)
 
 A Go library for managing the lifecycle of an application with graceful shutdown capabilities.
 
